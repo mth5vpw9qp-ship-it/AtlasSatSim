@@ -1,0 +1,35 @@
+name: Build Atlas IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Atlas .app
+        run: |
+          xcodebuild \
+            -project Project.xcodeproj \
+            -scheme YourScheme \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package into unsigned .ipa
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/*.app Payload/
+          zip -r atlas.ipa Payload
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Atlas-IPA
+          path: atlas.ipa
