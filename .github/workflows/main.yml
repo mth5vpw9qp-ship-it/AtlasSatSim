@@ -1,0 +1,68 @@
+name: Build unsigned iOS package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Extract app source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f AtlasSatSim-source.zip
+          mkdir -p "$RUNNER_TEMP/atlassatsim-source"
+          /usr/bin/unzip -q AtlasSatSim-source.zip -d "$RUNNER_TEMP/atlassatsim-source"
+          project_path="$(find "$RUNNER_TEMP/atlassatsim-source" -type d -name 'AtlasSatSim.xcodeproj' -print -quit)"
+          if [[ -z "$project_path" ]]; then
+            echo "AtlasSatSim.xcodeproj was not found inside AtlasSatSim-source.zip." >&2
+            exit 1
+          fi
+          echo "PROJECT_PATH=$project_path" >> "$GITHUB_ENV"
+          echo "Found project: $project_path"
+          xcodebuild -list -project "$project_path"
+
+      - name: Archive app for iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "$PROJECT_PATH" \
+            -scheme AtlasSatSim \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/AtlasSatSim.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            archive
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="$RUNNER_TEMP/AtlasSatSim.xcarchive/Products/Applications/AtlasSatSim.app"
+          if [[ ! -d "$app_path" ]]; then
+            echo "The archive did not contain AtlasSatSim.app." >&2
+            exit 1
+          fi
+          mkdir -p build/ipa/Payload
+          cp -R "$app_path" build/ipa/Payload/
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
+            build/ipa/Payload build/AtlasSatSim-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: AtlasSatSim-unsigned-ipa
+          path: build/AtlasSatSim-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
