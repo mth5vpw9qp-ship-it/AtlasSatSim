@@ -1,0 +1,206 @@
+
+name: Build AtlasSatSim IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: atlas-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned iOS IPA
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show repository structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Repository root: $GITHUB_WORKSPACE"
+          echo "Files and project directories:"
+          find . -maxdepth 6 \( -name '*.xcodeproj' -o -name '*.xcworkspace' -o -name '*.xcscheme' -o -name '*.swift' \) -print
+
+      - name: Find Xcode project and shared scheme
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          projects=()
+          while IFS= read -r path; do
+            projects+=("$path")
+          done < <(find . -maxdepth 8 -type d -name '*.xcodeproj' -prune -print)
+
+          if [[ "${#projects[@]}" -eq 0 ]]; then
+            echo "ERROR: No .xcodeproj directory was found."
+            echo "Check that the Xcode project files are committed to the repository."
+            exit 1
+          fi
+
+          if [[ "${#projects[@]}" -gt 1 ]]; then
+            echo "ERROR: Multiple Xcode projects found:"
+            printf '%s\n' "${projects[@]}"
+            exit 1
+          fi
+
+          project_path="${projects[0]}"
+          project_name="$(basename "$project_path" .xcodeproj)"
+          scheme_dir="$project_path/xcshareddata/xcschemes"
+
+          if [[ ! -d "$scheme_dir" ]]; then
+            echo "ERROR: Shared scheme directory not found: $scheme_dir"
+            exit 1
+          fi
+
+          schemes=()
+          while IFS= read -r path; do
+            schemes+=("$path")
+          done < <(find "$scheme_dir" -maxdepth 1 -type f -name '*.xcscheme' -print)
+
+          if [[ "${#schemes[@]}" -eq 0 ]]; then
+            echo "ERROR: No shared Xcode scheme was found."
+            exit 1
+          fi
+
+          selected_scheme=""
+          for path in "${schemes[@]}"; do
+            if [[ "$(basename "$path" .xcscheme)" == "$project_name" ]]; then
+              selected_scheme="$path"
+              break
+            fi
+          done
+
+          if [[ -z "$selected_scheme" ]]; then
+            if [[ "${#schemes[@]}" -ne 1 ]]; then
+              echo "ERROR: Multiple schemes found and none matches $project_name:"
+              printf '%s\n' "${schemes[@]}"
+              exit 1
+            fi
+            selected_scheme="${schemes[0]}"
+          fi
+
+          scheme_name="$(basename "$selected_scheme" .xcscheme)"
+
+          echo "Project: $project_path"
+          echo "Scheme: $scheme_name"
+
+          {
+            echo "project_path=$project_path"
+            echo "scheme_name=$scheme_name"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Select and report Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Validate Xcode project
+        shell: bash
+        env:
+          PROJECT_PATH: ${{ steps.discover.outputs.project_path }}
+        run: |
+          set -euo pipefail
+          test -f "$PROJECT_PATH/project.pbxproj"
+          xcodebuild -list -project "$PROJECT_PATH"
+
+      - name: Build and archive unsigned app
+        shell: bash
+        env:
+          PROJECT_PATH: ${{ steps.discover.outputs.project_path }}
+          SCHEME_NAME: ${{ steps.discover.outputs.scheme_name }}
+        run: |
+          set -euo pipefail
+          set -o pipefail
+
+          xcodebuild \
+            -project "$PROJECT_PATH" \
+            -scheme "$SCHEME_NAME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/AtlasSatSim.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            archive 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Package and verify IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive="$RUNNER_TEMP/AtlasSatSim.xcarchive"
+          products="$archive/Products/Applications"
+
+          if [[ ! -d "$products" ]]; then
+            echo "ERROR: Archive contains no Applications directory."
+            exit 1
+          fi
+
+          apps=()
+          while IFS= read -r path; do
+            apps+=("$path")
+          done < <(find "$products" -maxdepth 1 -type d -name '*.app' -print)
+
+          if [[ "${#apps[@]}" -ne 1 ]]; then
+            echo "ERROR: Expected one app; found ${#apps[@]}."
+            find "$products" -maxdepth 3 -print
+            exit 1
+          fi
+
+          app="${apps[0]}"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
+
+          if [[ ! -f "$app/$executable" ]]; then
+            echo "ERROR: App executable is missing."
+            exit 1
+          fi
+
+          ipa_root="$RUNNER_TEMP/ipa-root"
+          mkdir -p "$ipa_root/Payload"
+
+          ditto "$app" "$ipa_root/Payload/$(basename "$app")"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$ipa_root/Payload" \
+            "$GITHUB_WORKSPACE/AtlasSatSim-unsigned.ipa"
+
+          test -s "$GITHUB_WORKSPACE/AtlasSatSim-unsigned.ipa"
+
+          unzip -Z1 "$GITHUB_WORKSPACE/AtlasSatSim-unsigned.ipa" \
+            | grep -E '^Payload/[^/]+\.app/Info.plist$'
+
+          echo "IPA successfully packaged."
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AtlasSatSim-unsigned-IPA
+          path: AtlasSatSim-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Xcode build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AtlasSatSim-build-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
