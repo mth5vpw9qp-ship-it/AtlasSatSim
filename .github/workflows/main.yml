@@ -1,0 +1,145 @@
+
+name: Build AtlasSatSim IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Reconstruct, build and package IPA
+    runs-on: macos-26
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Report Xcode version
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Reconstruct Xcode project structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking flattened project files..."
+
+          test -f project.xcodeproj
+          test -f AtlasSatSim.xcscheme
+          test -f AtlasSatSimApp.swift
+
+          SOURCE="$RUNNER_TEMP/AtlasSatSim-source"
+          PROJECT="$SOURCE/AtlasSatSim.xcodeproj"
+
+          mkdir -p "$PROJECT/xcshareddata/xcschemes"
+          mkdir -p "$SOURCE/AtlasSatSim"
+
+          cp project.xcodeproj "$PROJECT/project.pbxproj"
+          cp AtlasSatSim.xcscheme \
+            "$PROJECT/xcshareddata/xcschemes/AtlasSatSim.xcscheme"
+          cp AtlasSatSimApp.swift \
+            "$SOURCE/AtlasSatSim/AtlasSatSimApp.swift"
+
+          echo "Reconstructed project:"
+          find "$SOURCE" -maxdepth 6 -print
+
+          test -f "$PROJECT/project.pbxproj"
+          test -f "$PROJECT/xcshareddata/xcschemes/AtlasSatSim.xcscheme"
+          test -f "$SOURCE/AtlasSatSim/AtlasSatSimApp.swift"
+
+      - name: Validate reconstructed Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="$RUNNER_TEMP/AtlasSatSim-source/AtlasSatSim.xcodeproj"
+
+          xcodebuild -list \
+            -project "$PROJECT"
+
+      - name: Build and archive unsigned app
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+
+          PROJECT="$RUNNER_TEMP/AtlasSatSim-source/AtlasSatSim.xcodeproj"
+
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme AtlasSatSim \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/AtlasSatSim.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            archive 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_DIR="$RUNNER_TEMP/AtlasSatSim.xcarchive/Products/Applications"
+          IPA_ROOT="$RUNNER_TEMP/ipa-root"
+
+          test -d "$APP_DIR"
+
+          APPS=()
+          while IFS= read -r APP; do
+            APPS+=("$APP")
+          done < <(find "$APP_DIR" -maxdepth 1 -type d -name '*.app' -print)
+
+          if [[ "${#APPS[@]}" -ne 1 ]]; then
+            echo "Expected one application, found ${#APPS[@]}"
+            exit 1
+          fi
+
+          APP="${APPS[0]}"
+          EXECUTABLE=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleExecutable' "$APP/Info.plist")
+
+          test -f "$APP/$EXECUTABLE"
+
+          mkdir -p "$IPA_ROOT/Payload"
+          ditto "$APP" "$IPA_ROOT/Payload/$(basename "$APP")"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$IPA_ROOT/Payload" \
+            "$GITHUB_WORKSPACE/AtlasSatSim-unsigned.ipa"
+
+          test -s "$GITHUB_WORKSPACE/AtlasSatSim-unsigned.ipa"
+
+          unzip -Z1 "$GITHUB_WORKSPACE/AtlasSatSim-unsigned.ipa" \
+            | grep -E '^Payload/[^/]+\.app/Info.plist$'
+
+          echo "Unsigned IPA packaged successfully."
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AtlasSatSim-unsigned-IPA
+          path: AtlasSatSim-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AtlasSatSim-build-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
