@@ -1,0 +1,110 @@
+
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: atlas-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build AtlasSatSim (unsigned)
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Select and report Xcode
+        run: |
+          set -euo pipefail
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Validate project and shared scheme
+        run: |
+          set -euo pipefail
+          test -d AtlasSatSim.xcodeproj
+          test -f AtlasSatSim.xcodeproj/project.pbxproj
+          test -f AtlasSatSim.xcodeproj/xcshareddata/xcschemes/AtlasSatSim.xcscheme
+          test -f AtlasSatSim/AtlasSatSimApp.swift
+          xcodebuild -list -project AtlasSatSim.xcodeproj
+
+      - name: Build and archive for generic iOS device
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          xcodebuild \
+            -project AtlasSatSim.xcodeproj \
+            -scheme AtlasSatSim \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/AtlasSatSim.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            archive 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Package and validate unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/AtlasSatSim.xcarchive"
+          products="$archive/Products/Applications"
+          test -d "$products"
+
+          apps=()
+          while IFS= read -r app_path; do
+            apps+=("$app_path")
+          done < <(find "$products" -maxdepth 1 -type d -name '*.app' -print)
+
+          if [[ "${#apps[@]}" -ne 1 ]]; then
+            echo "Expected exactly one .app in archive; found ${#apps[@]}"
+            find "$products" -maxdepth 2 -print
+            exit 1
+          fi
+
+          app="${apps[0]}"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
+          test -n "$executable"
+          test -f "$app/$executable"
+
+          ipa_root="$RUNNER_TEMP/ipa-root"
+          mkdir -p "$ipa_root/Payload"
+          ditto "$app" "$ipa_root/Payload/$(basename "$app")"
+          ditto -c -k --sequesterRsrc --keepParent "$ipa_root/Payload" "$GITHUB_WORKSPACE/AtlasSatSim-unsigned.ipa"
+
+          test -s "$GITHUB_WORKSPACE/AtlasSatSim-unsigned.ipa"
+          unzip -l "$GITHUB_WORKSPACE/AtlasSatSim-unsigned.ipa"
+          unzip -Z1 "$GITHUB_WORKSPACE/AtlasSatSim-unsigned.ipa" | grep -q '^Payload/[^/]\+\.app/Info.plist$'
+          echo "Created unsigned IPA: AtlasSatSim-unsigned.ipa"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AtlasSatSim-unsigned-ipa
+          path: AtlasSatSim-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Xcode build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AtlasSatSim-xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
